@@ -1,0 +1,1037 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ASCII Plant</title>
+
+    <style>
+        html,
+        body {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            overflow: hidden;
+            background: #050805;
+        }
+
+        canvas {
+            display: block;
+            width: 100%;
+            filter: contrast(1.05);
+            height: 100%;
+        }
+
+        #fullscreen-button {
+    position: fixed;
+    right: 20px;
+    bottom: 20px;
+    z-index: 10;
+    padding: 10px 14px;
+    border: 1px solid #9dff8d;
+    border-radius: 4px;
+    background: rgba(5, 8, 5, 0.8);
+    color: #9dff8d;
+    font: 14px monospace;
+    cursor: pointer;
+}
+
+#fullscreen-button:hover {
+    background: #9dff8d;
+    color: #050805;
+}
+
+:fullscreen #fullscreen-button {
+    display: none;
+}
+    </style>
+</head>
+
+<body>
+    <canvas id="plant-screen"></canvas>
+    <button id="fullscreen-button" type="button">
+        Fullscreen
+    </button>
+    
+<script>
+    const canvas = document.querySelector("#plant-screen");
+    const context = canvas.getContext("2d");
+
+    const fullscreenButton =
+            document.querySelector("#fullscreen-button");
+
+        async function toggleFullscreen() {
+            try {
+                if (!document.fullscreenElement) {
+                    await document.documentElement.requestFullscreen();
+                } else {
+                    await document.exitFullscreen();
+                }
+            } catch (error) {
+                console.error("Fullscreen could not be changed:", error);
+            }
+        }
+
+        fullscreenButton.addEventListener(
+            "click",
+            toggleFullscreen
+        );
+
+        document.addEventListener(
+            "fullscreenchange",
+            () => {
+                fullscreenButton.textContent =
+                    document.fullscreenElement
+                        ? "Exit fullscreen"
+                        : "Fullscreen";
+
+                resizeCanvas();
+                drawPlant();
+            }
+        );
+
+    let screenWidth;
+    let screenHeight;
+    let devicePixelRatio;
+
+
+
+    let isPaused = false;
+    let fontSize;
+    let characterWidth;
+    let characterHeight;
+    let columns;
+    let rows;
+    let offsetX;
+    let offsetY;
+    let characterBuffer;
+    let previousBuffer;
+    let characterBirthTimes;
+    let soilHeights = [];
+    let soilPhase = Math.random() * Math.PI * 2;
+
+    let nodes =[];
+
+    class PlantNode {
+        constructor(column, row, parentIndex = -1) {
+            this.column = column;
+            this.row = row;
+            this.parentIndex = parentIndex;
+        }
+    }
+
+    class AttractionPoint {
+        constructor(column, row) {
+            this.column = column;
+            this.row = row;
+            this.active = true;
+        }
+    }
+    let attractionPoints = [];
+
+    let nextRow;
+    let growthTimer;
+    let branchWeights = [];
+    let plantStyle;
+    let plantPhase ="growing";
+    let phaseStartedAt = 0;
+
+    const holdDuration = 5000;
+    const faceDuration = 1200;
+    const fadeDuration = 2200;
+    const influenceRadius = 12;
+    const killDistance = 2;
+    const segmentLength = 1;
+    const leafCharacters = ".:*o+";
+
+    const plantPalettes = [
+        {
+            normal: "#9dff8d",
+            highlight: "#eaffee"
+        },
+        {
+            normal:"#ffb454",
+            highlight:"#fff2d6"
+        },
+        {
+            normal: "#7fe0ff",
+            highlight: "#e6faff"
+        },
+        {
+            normal: "#ff8fb1",
+            highlight: "#ffe6ee"
+        },
+        {
+            normal: "#f1efe6",
+            highlight: "#ffffff"
+        }
+    ];
+
+    let currentPalette;
+
+    const growthHighlightDuration = 350;
+
+    function drawLeaf(node, nodeIndex) {
+        const leafCharacter =
+            leafCharacters[nodeIndex % leafCharacters.length];
+
+        putCharacter(
+            Math.round(node.column),
+            Math.round(node.row),
+            leafCharacter
+        );
+    }
+
+    window.addEventListener("keydown", event => {
+            if (event.key.toLowerCase() === "p") {
+                isPaused = !isPaused;
+            }
+
+            if (event.key.toLowerCase() === "r") {
+                clearTimeout(growthTimer);
+                createTestPlant();
+                drawPlant();
+                startGrowth();
+            }
+
+            if (event.key.toLowerCase() === "f") {
+            toggleFullscreen();
+        }
+        });
+
+    function resizeCanvas() {
+        devicePixelRatio = window.devicePixelRatio || 1;
+
+        screenWidth = canvas.clientWidth;
+        screenHeight = canvas.clientHeight;
+
+        canvas.width = screenWidth * devicePixelRatio;
+        canvas.height = screenHeight * devicePixelRatio;
+
+        context.setTransform(
+            devicePixelRatio,
+            0,
+            0,
+            devicePixelRatio,
+            0,
+            0
+        );
+
+        fontSize = Math.max(
+            10,
+            Math.min(
+                18,
+                Math.round(Math.min(screenWidth, screenHeight) / 48)
+            )
+        );
+
+        context.font = `${fontSize}px monospace`;
+        context.textBaseline = "top";
+
+        characterWidth = context.measureText("M").width;
+        characterHeight = Math.round(fontSize * 1.15);
+
+        columns = Math.floor(screenWidth / characterWidth);
+        rows = Math.floor(screenHeight / characterHeight);
+
+        characterBuffer = new Uint8Array(columns * rows);
+        previousBuffer = new Uint8Array(columns * rows);
+        characterBirthTimes = new Float64Array(columns * rows);
+
+        offsetX =
+            (screenWidth - columns * characterWidth) / 2;
+
+        offsetY =
+            (screenHeight - rows * characterHeight) / 2;
+    }
+
+
+    function putCharacter(column, row, character) {
+        if (
+            column < 0 ||
+            column >= columns ||
+            row < 0 ||
+            row >= rows
+        ) {
+            return;
+        }
+
+        const index = row * columns + column;
+
+        characterBuffer[index] = character.charCodeAt(0);
+        
+    }
+
+    function createAttractionPoints() {
+        const points = [];
+
+        const centerColumn =
+            columns / 2 + plantStyle.centerOffset;
+
+        const centerRow =
+            rows * 0.38;
+
+        const radiusX =
+            columns * 0.32 * plantStyle.width;
+
+        const radiusY =
+            rows * 0.32 * plantStyle.height;
+
+        for (
+            let i = 0;
+            i < plantStyle.pointCount;
+            i += 1
+        ) {
+            const angle = Math.random() * Math.PI * 2;
+            const distance = Math.sqrt(Math.random());
+
+            const column = Math.round(
+                centerColumn +
+                Math.cos(angle) * distance * radiusX 
+            );
+            const row = Math.round(
+                centerRow +
+                Math.sin(angle) * distance * radiusY
+            );
+
+            if (
+                column >= 1 &&
+                column < columns - 1 &&
+                row >= 1 &&
+                row < rows - 8
+            ) {
+                points.push(
+                    new AttractionPoint(column, row)
+                );
+            }
+        }
+        return points;
+    }
+
+    function createSoilProfile(rootRow, rootColumn) {
+        const profile = [];
+
+        for (
+            let column = 0;
+            column < columns;
+            column += 1
+    
+        ) {
+            const distanceFromRoot = 
+                Math.abs(column - rootColumn);
+
+            const broadWave =
+                (Math.sin(column * 0.28 + soilPhase) * 1.2);
+
+            const smallWave =
+                Math.sin(column * 0.75 + soilPhase * 1.7) *0.45;
+
+            const rootBump =
+                Math.min(distanceFromRoot * 0.08, 1.5);
+
+            let surfaceRow =
+                rootRow +
+                1 +
+                Math.round(broadWave + smallWave + rootBump);
+
+            surfaceRow = Math.max(
+                1,
+                Math.min(rows - 2, surfaceRow)
+            );
+            
+            profile.push(surfaceRow);
+
+        }
+        profile[rootColumn] = rootRow + 1;
+
+        return profile;
+    }
+
+
+
+
+    function createTestPlant() {
+            nodes = [];
+
+            currentPalette =
+                plantPalettes [
+                    Math.floor(
+                        Math.random() * plantPalettes.length
+                    )
+                ];
+
+            plantPhase = "growing";
+            phaseStartedAt = 0;
+
+
+            plantStyle = {
+                centerOffset:
+                    (Math.random() - 0.5) * columns * 0.18,
+
+                width:
+                    0.75 + Math.random() * 0.55,
+                
+                height:
+                    0.8 + Math.random() * 0.4,
+
+                pointCount:
+                    140 + Math.floor(Math.random() * 100)
+            };
+
+            attractionPoints = createAttractionPoints();
+
+            const centerColumn = Math.floor(columns / 2);
+            const bottomRow = rows - 4;
+            nextRow = bottomRow - 1;
+
+            const root = new PlantNode(
+                centerColumn,
+                bottomRow,
+                -1
+            );
+
+            nodes.push(root);
+
+            soilPhase = 
+                Math.random() * Math.PI * 2;
+
+            soilHeights =
+                createSoilProfile(bottomRow, centerColumn);
+
+           
+        }
+
+    function hasReachedTop() {
+        return nodes.some(node => {
+            return node.row <= 2;
+        });
+    }
+    
+    function growOneStemNode() {
+            const directionColumns =
+                new Array(nodes.length).fill(0);
+
+            const directionRows =
+                new Array(nodes.length).fill(0);
+
+            const influenceCounts =
+                new Array(nodes.length).fill(0);
+
+            let activePointCount = 0;
+
+            for (const point of attractionPoints) {
+                if (!point.active) {
+                    continue;
+                }
+
+                activePointCount += 1;
+
+                let closestNodeIndex = -1;
+                let closestDistance = Infinity;
+
+                for (let i = 0; i < nodes.length; i += 1) {
+                    const node = nodes[i];
+
+                    const differenceColumn =
+                        point.column - node.column;
+
+                    const differenceRow =
+                        point.row - node.row;
+
+                    const distance = Math.sqrt(
+                        differenceColumn * differenceColumn +
+                        differenceRow * differenceRow
+                    );
+
+                    if (
+                        distance < closestDistance &&
+                        distance <= influenceRadius
+                    ) {
+                        closestDistance = distance;
+                        closestNodeIndex = i;
+                    }
+                }
+
+                if (closestNodeIndex === -1) {
+                    continue;
+                }
+
+                const closestNode =
+                    nodes[closestNodeIndex];
+
+                const differenceColumn =
+                    point.column - closestNode.column;
+
+                const differenceRow =
+                    point.row - closestNode.row;
+
+                const distance = Math.sqrt(
+                    differenceColumn * differenceColumn +
+                    differenceRow * differenceRow
+                ) || 1;
+
+                directionColumns[closestNodeIndex] +=
+                    differenceColumn / distance;
+
+                directionRows[closestNodeIndex] +=
+                    differenceRow / distance;
+
+                influenceCounts[closestNodeIndex] += 1;
+            }
+
+            const newNodes = [];
+
+            for (let i = 0; i < nodes.length; i += 1) {
+                if (influenceCounts[i] === 0) {
+                    continue;
+                }
+
+                let directionColumn =
+                    directionColumns[i] /
+                    influenceCounts[i];
+
+                let directionRow =
+                    directionRows[i] /
+                    influenceCounts[i];
+
+                directionRow -= 0.25;
+
+                const directionLength = Math.sqrt(
+                    directionColumn * directionColumn +
+                    directionRow * directionRow
+                ) || 1;
+
+                directionColumn /= directionLength;
+                directionRow /= directionLength;
+
+                const parent = nodes[i];
+
+                const child = new PlantNode(
+                    parent.column +
+                    directionColumn * segmentLength,
+
+                    parent.row +
+                    directionRow * segmentLength,
+
+                    i
+                );
+
+                newNodes.push(child);
+            }
+
+            for (const child of newNodes) {
+                nodes.push(child);
+
+                for (const point of attractionPoints) {
+                    if (!point.active) {
+                        continue;
+                    }
+
+                    const differenceColumn =
+                        point.column - child.column;
+
+                    const differenceRow =
+                        point.row - child.row;
+
+                    const distance = Math.sqrt(
+                        differenceColumn * differenceColumn +
+                        differenceRow * differenceRow
+                    );
+
+                    if (distance <= killDistance) {
+                        point.active = false;
+                    }
+                }
+            }
+
+            if (newNodes.length > 0) {
+                drawPlant();
+                return true;
+            }
+
+            if (activePointCount === 0) {
+                return false;
+            }
+
+            return growStraightFallback();
+        }
+
+    function growStraightFallback() {
+        if (nextRow < 1) {
+            return false;
+        }
+
+        const parentIndex = nodes.length - 1;
+        const parent = nodes[parentIndex];
+
+        const child = new PlantNode(
+            parent.column,
+            nextRow,
+            parentIndex
+        );
+
+        nodes.push(child);
+        nextRow -= 1;
+
+        drawPlant();
+
+        return true;
+    }
+
+    function getBranchedCharacter(parent, child) {
+        const differenceColumn =
+            child.column - parent.column;
+
+        const differenceRow =
+            child.row - parent.row;
+
+        if (
+            Math.abs(differenceColumn) <
+            Math.abs(differenceRow) * 0.45
+        ) {
+            return "|";
+        }
+
+        if (
+            Math.abs(differenceRow) <
+            Math.abs(differenceColumn) * 0.45
+        ) {
+            return "-";
+        }
+
+        if (differenceColumn * differenceRow < 0) {
+            return "/";
+        }
+
+        return "\\";
+        
+
+    }
+
+    function drawBranch(parent, child) {
+            const differenceColumn =
+                child.column - parent.column;
+
+            const differenceRow =
+                child.row - parent.row;
+
+            const distance = Math.sqrt(
+                differenceColumn * differenceColumn +
+                differenceRow * differenceRow
+            );
+
+            const steps = Math.max(
+                1,
+                Math.ceil(distance * 2)
+            );
+
+            const childIndex =
+                nodes.indexOf(child);
+
+            const character =
+                getWeightedBranchCharacter(
+                    parent,
+                    child,
+                    childIndex
+                );
+            for (
+                let step = 0;
+                step <= steps;
+                step += 1
+            ) {
+                const amount = step / steps;
+
+                const column = Math.round(
+                    parent.column +
+                    differenceColumn * amount
+                );
+
+                const row = Math.round(
+                    parent.row +
+                    differenceRow * amount
+                );
+
+                putCharacter(
+                    column,
+                    row,
+                    character
+                );
+            }
+        }
+
+    
+
+    function isTipNode(nodeIndex){
+        return !nodes.some(node => {
+            return node.parentIndex === nodeIndex;
+
+        });
+    }
+
+    function getHighestNode() {
+        let highestNode = nodes[0];
+
+        for (const node of nodes) {
+            if (node.row < highestNode.row) {
+                highestNode = node;
+            }
+        }
+
+        return highestNode;
+    }
+
+    function drawFacingAway() {
+        const highestNode = getHighestNode();  
+        
+        const column = Math.round(highestNode.column);
+        const row = Math.round(highestNode.row);
+
+        putCharacter(column, row, "(");
+        putCharacter(column + 1, row, "o");
+        putCharacter(column + 2, row, ")");
+
+    }
+
+    function calculateBranchWeights() {
+        branchWeights = new Array(nodes.length).fill(1);
+
+        for (
+            let i = nodes.length - 1;
+            i >= 0;
+            i -= 1
+        ) {
+            const parentIndex =
+                nodes[i].parentIndex;
+
+            if (parentIndex >= 0) {
+                branchWeights[parentIndex] +=
+                    branchWeights[i];
+            }
+        }
+    }
+
+
+    function drawPlant(alpha = 1) {
+            characterBuffer.fill(0);
+            calculateBranchWeights();
+
+            for (
+                let i = 0;
+                i < nodes.length;
+                i += 1
+            ) {
+                const child = nodes[i];
+
+                if (child.parentIndex === -1) {
+                    putCharacter(
+                        Math.round(child.column),
+                        Math.round(child.row),
+                        "|"
+                    );
+
+                    continue;
+                }
+
+                const parent = nodes[child.parentIndex];
+
+                drawBranch(parent, child);
+            }
+
+            drawSoil();
+
+            if (
+                plantPhase === "facing" ||
+                plantPhase === "holding" ||
+                plantPhase === "fading"
+            ) {
+                for (
+                    let i = 0;
+                    i < nodes.length;
+                    i += 1
+                ) {
+                    if (isTipNode(i)) {
+                        drawLeaf(nodes[i], i);
+                    }
+                }
+
+                drawFacingAway();
+            }
+
+            drawCharacterBuffer(alpha);
+        }
+
+         
+
+    function drawCharacterBuffer(alpha = 1) {
+        const now = performance.now();
+
+        context.shadowColor = currentPalette.normal;
+        context.shadowBlur = 5;
+
+        context.fillStyle = "#050805";
+        context.fillRect(
+            0,
+            0,
+            screenWidth,
+            screenHeight
+        );
+
+        context.globalAlpha = alpha;
+
+        for (
+            let row = 0;
+            row < rows;
+            row += 1
+        ) {
+            for (
+                let column = 0;
+                column < columns;
+                column += 1
+            ) {
+                const index =
+                    row * columns + column;
+
+                const characterCode =
+                    characterBuffer[index];
+
+                if (characterCode === 0) {
+                    previousBuffer[index] = 0;
+                    continue;
+                }
+
+                if (
+                    previousBuffer[index] !== characterCode
+                ) {
+                    characterBirthTimes[index] = now;
+                }
+
+                previousBuffer[index] = characterCode;
+
+                const isNew =
+                    now - characterBirthTimes[index] <
+                    growthHighlightDuration;
+
+                context.fillStyle = isNew
+                    ? currentPalette.highlight
+                    : currentPalette.normal;
+
+                context.fillText(
+                    String.fromCharCode(characterCode),
+                    offsetX + column * characterWidth,
+                    offsetY + row * characterHeight
+                );
+            }
+        }
+
+    context.shadowBlur = 0;
+        context.shadowColor = "transparent";
+
+        context.globalAlpha = 1;
+    }
+
+     function redraw() {
+            resizeCanvas();
+            createTestPlant();
+            drawPlant();
+        }
+
+        function startGrowth() {
+
+            if (isPaused) {
+                return;
+            }
+            if (plantPhase !== "growing") {
+                return;
+            }
+
+            if (hasReachedTop()) {
+                plantPhase = "facing";
+                phaseStartedAt = performance.now();
+                drawPlant();
+                startFacing();
+                return;
+            }
+
+            const canContinueGrowing = growOneStemNode();
+
+            if (!canContinueGrowing) {
+                plantPhase = "facing";
+                phaseStartedAt = performance.now();
+                drawPlant();
+                startFacing();
+                return;
+            }
+
+            growthTimer = setTimeout(
+                startGrowth,
+                150
+            );
+        }
+
+        function startFacing() {
+            const elapsed =
+                performance.now() - phaseStartedAt;
+
+            if (elapsed >= faceDuration) {
+                plantPhase = "holding";
+                phaseStartedAt = performance.now();
+                drawPlant();
+                startHolding();
+                return;
+            }
+
+            drawPlant();
+
+            growthTimer = setTimeout (
+                startFacing,
+                100
+            )
+        }
+
+        function startHolding() {
+                const elapsed =
+                    performance.now() - phaseStartedAt;
+
+                if (elapsed >= holdDuration) {
+                    plantPhase = "fading";
+                    phaseStartedAt = performance.now();
+                    startFading();
+                    return;
+                }
+
+                drawPlant();
+
+                growthTimer = setTimeout(
+                    startHolding,
+                    100
+                );
+            }
+
+        function startFading() {
+            const elapsed =
+                performance.now() - phaseStartedAt;
+
+                const alpha =
+                    1 - elapsed / fadeDuration;
+
+            if (elapsed >= fadeDuration) {
+                createTestPlant();
+                drawPlant();
+                startGrowth();
+                return;
+            }
+
+            drawPlant(Math.max(0, alpha));
+
+            growthTimer = setTimeout(
+                startFading,
+                50
+            );
+        }
+
+        function renderFrame() {
+            let alpha = 1;
+
+            if (plantPhase === "fading") {
+                alpha = Math.max(
+                    0,
+                    1 -
+                    (performance.now() - phaseStartedAt) /
+                    fadeDuration
+                );
+            }
+
+            drawPlant(alpha);
+            requestAnimationFrame(renderFrame);
+        }
+
+        function getWeightedBranchCharacter(
+            parent,
+            child,
+            childIndex
+        ) {
+            const weight =
+                branchWeights[childIndex] || 1;
+
+            if (weight > 20) {
+                return "#";
+            }
+
+            if (weight > 8) {
+                return "0";
+            }
+
+            return getBranchedCharacter(parent, child);
+        }
+
+
+        function drawSoil() {
+            const soilCharacters = "_~^";
+
+            for (
+                let column = 0;
+                column < columns;
+                column += 1
+            ) {
+                const surfaceRow = 
+                    soilHeights[column];
+
+                const wave =
+                    Math.sin(
+                        column * 0.45 +
+                        soilPhase +
+                        performance.now() * 0.0008
+                    );
+
+                const characterIndex = Math.max(
+                    0,
+                    Math.min(
+                        soilCharacters.length - 1,
+                        Math.round((wave + 1) * 0.5 * 2)
+                    )
+                );
+
+                putCharacter(
+                    column,
+                    surfaceRow,
+                    soilCharacters[characterIndex]
+                );
+
+
+                for (
+                    let row = surfaceRow + 1;
+                    row < rows;
+                    row += 1
+                ) {
+                    putCharacter(
+                        column,
+                        row,
+                        "#"
+                    );
+                }
+                        
+            }
+            
+        }
+                
+
+
+        redraw();
+        startGrowth();
+        renderFrame();
+
+        window.addEventListener("resize", () => {
+            clearTimeout(growthTimer);
+            redraw();
+            startGrowth();
+        });
+
+
+
+
+
+</script>
+</body>
+
+</html> 
